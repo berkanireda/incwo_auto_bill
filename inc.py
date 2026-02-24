@@ -43,6 +43,75 @@ def parse_first_xml_int_tag(xml_text: str, tag_name: str = "id") -> Optional[int
         pass
     return None
 
+def get_firm_id_by_name(cfg: Config, firm_name: str) -> Optional[int]:
+    """Interroge l'API pour trouver l'ID d'un client à partir de son nom."""
+    if not firm_name or pd.isna(firm_name):
+        return None
+        
+    url = f"{cfg.base_url.rstrip('/')}/{cfg.business_file_id}/firms.xml"
+    
+    resp = requests.get(
+        url,
+        auth=HTTPBasicAuth(cfg.login, cfg.password),
+        headers={"Accept": "application/xml"},
+        verify=False,
+        timeout=cfg.timeout_seconds
+    )
+    
+    if resp.status_code >= 300:
+        print(f"❌ Erreur lors de la récupération des clients: {resp.status_code}")
+        return None
+        
+    try:
+        root = ET.fromstring(resp.text)
+        # On parcourt chaque client (firm) renvoyé par l'API
+        for firm in root.findall(".//firm"):
+            name_node = firm.find("name")
+            id_node = firm.find("id")
+            
+            if name_node is not None and id_node is not None and name_node.text is not None and id_node.text is not None:
+                # Si le nom correspond (en ignorant la casse)
+                if name_node.text.strip().lower() == str(firm_name).strip().lower():
+                    return int(id_node.text.strip())
+    except ET.ParseError:
+        print("❌ Erreur de parsing XML lors de la recherche du client.")
+        
+    return None
+
+def get_product_id_by_name(cfg: Config, product_name: str) -> Optional[int]:
+    """Interroge l'API pour trouver l'ID d'un produit à partir de son nom."""
+    if not product_name or pd.isna(product_name):
+        return None
+        
+    url = f"{cfg.base_url.rstrip('/')}/{cfg.business_file_id}/customer_products.xml"
+    
+    resp = requests.get(
+        url,
+        auth=HTTPBasicAuth(cfg.login, cfg.password),
+        headers={"Accept": "application/xml"},
+        verify=False,
+        timeout=cfg.timeout_seconds
+    )
+    
+    if resp.status_code >= 300:
+        print(f"❌ Erreur lors de la récupération des produits: {resp.status_code}")
+        return None
+        
+    try:
+        root = ET.fromstring(resp.text)
+        # On parcourt chaque produit renvoyé par l'API
+        for prod in root.findall(".//customer_product"):
+            name_node = prod.find("name")
+            id_node = prod.find("id")
+            
+            if name_node is not None and id_node is not None and name_node.text is not None and id_node.text is not None:
+                if name_node.text.strip().lower() == str(product_name).strip().lower():
+                    return int(id_node.text.strip())
+    except ET.ParseError:
+        print("❌ Erreur de parsing XML lors de la recherche du produit.")
+        
+    return None
+
 def build_bill_sheet_xml(
     row: Dict[str, Any],
     bank_account_id: int,
@@ -56,7 +125,8 @@ def build_bill_sheet_xml(
   <firm_id>{int(firm_id)}</firm_id>
   <bank_account_id>{int(bank_account_id)}</bank_account_id>
   <billing_date>{esc(normalize_date_dd_mm_yyyy(row.get("billing_date")))}</billing_date>
-  <sheet_type>invoice</sheet_type>
+  <sheet_type>invoice_maybe</sheet_type>
+  <is_repeat>0</is_repeat>
   <title>{esc(row.get("title", ""))}</title>
   <billing_add_name>{esc(billing_address.get("name",""))}</billing_add_name>
   <billing_add_street_address>{esc(billing_address.get("street",""))}</billing_add_street_address>
@@ -110,7 +180,6 @@ def main():
 
     INPUT_FILE = "res.xlsx"
     BANK_ACCOUNT_ID = 3078309
-    PRODUCT_ID = 1000342059 
     
     BILLING_ADDRESS = {
         "name": "CLIENT TEST",
@@ -122,23 +191,57 @@ def main():
 
     for idx, row in df.iterrows():
         try:
-            xml_payload = build_bill_sheet_xml(row.to_dict(), BANK_ACCOUNT_ID, BILLING_ADDRESS, PRODUCT_ID)
+            row_dict = row.to_dict()
+            
+            # --- AJOUT: RECHERCHE DU CLIENT ---
+            # IMPORTANT: Remplace "client_name" par le nom exact de la colonne dans ton fichier res.xlsx
+            client_name = row_dict.get("client_name") 
+            
+            if not client_name or pd.isna(client_name):
+                print(f"⚠️ Aucun nom de client trouvé à la ligne {idx+1}. Ligne ignorée.")
+                failed += 1
+                continue
+                
+            firm_id = get_firm_id_by_name(cfg, client_name)
+            if not firm_id:
+                print(f"⚠️ Impossible de trouver l'ID pour le client: '{client_name}' à la ligne {idx+1}.")
+                failed += 1
+                continue
+            
+            # On injecte l'ID trouvé dans le dictionnaire pour la suite
+            row_dict["firm_id"] = firm_id
+            # ----------------------------------
+
+            # --- AJOUT: RECHERCHE DU PRODUIT ---
+            # IMPORTANT: Remplace "product_name" par le nom exact de la colonne dans ton fichier res.xlsx
+            product_name = row_dict.get("product_name")
+            
+            if not product_name or pd.isna(product_name):
+                print(f"⚠️ Aucun nom de produit trouvé à la ligne {idx+1}. Ligne ignorée.")
+                failed += 1
+                continue
+                
+            product_id = get_product_id_by_name(cfg, product_name)
+            if not product_id:
+                print(f"⚠️ Impossible de trouver l'ID pour le produit: '{product_name}' à la ligne {idx+1}.")
+                failed += 1
+                continue
+            # ----------------------------------
+
+            xml_payload = build_bill_sheet_xml(row_dict, BANK_ACCOUNT_ID, BILLING_ADDRESS, product_id)
             
             # 1. Création
             resp = post_bill_sheet(cfg, xml_payload)
             if 200 <= resp.status_code < 300:
                 bill_id = parse_first_xml_int_tag(resp.text)
-                print(f"✅ Créée : ID {bill_id}")
+                print(f"✅ Brouillon créé (Maintenant) : ID {bill_id}")
                 
-                # 2. Validation immédiate
-                if bill_id:
-                    v = validate_bill_sheet(cfg, bill_id)
-                    if v.status_code < 300:
-                        print(f"🚀 VALIDÉE : ID {bill_id}")
-                        ok += 1
-                    else:
-                        print(f"⚠️ Erreur Validation ID {bill_id}: {v.status_code}")
-                        failed += 1
+                # La validation immédiate est désactivée pour garder le statut brouillon
+                # if bill_id:
+                #     v = validate_bill_sheet(cfg, bill_id)
+                #     ...
+                
+                ok += 1
             else:
                 print(f"❌ Erreur Création ligne {idx+1}: {resp.status_code}")
                 failed += 1
